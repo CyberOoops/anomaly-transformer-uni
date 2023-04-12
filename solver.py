@@ -22,6 +22,111 @@ def adjust_learning_rate(optimizer, epoch, lr_):
             param_group['lr'] = lr
         print('Updating learning rate to {}'.format(lr))
 
+def get_range_proba(predict, label, delay=7):
+    predict = np.array(predict)
+    label = np.array(label)
+
+    splits = np.where(label[1:] != label[:-1])[0] + 1
+    is_anomaly = label[0] == 1
+    new_predict = np.array(predict)
+    pos = 0
+
+    for sp in splits:
+        if is_anomaly:
+            if 1 in predict[pos:min(pos + delay + 1, sp)]:
+                new_predict[pos: sp] = 1
+            else:
+                new_predict[pos: sp] = 0
+        is_anomaly = not is_anomaly
+        pos = sp
+    sp = len(label)
+
+    if is_anomaly:
+        if 1 in predict[pos: min(pos + delay + 1, sp)]:
+            new_predict[pos: sp] = 1
+        else:
+            new_predict[pos: sp] = 0
+
+    return new_predict
+
+def calc_p2p(predict, actual):
+    tp = np.sum(predict * actual)
+    tn = np.sum((1 - predict) * (1 - actual))
+    fp = np.sum(predict * (1 - actual))
+    fn = np.sum((1 - predict) * actual)
+
+    precision = (tp + 0.000001) / (tp + fp + 0.000001)
+    recall = (tp + 0.000001) / (tp + fn + 0.000001)
+    f1 = (2 * precision * recall) / (precision + recall)
+    return f1, precision, recall, tp, tn, fp, fn
+
+def delay_f1(score, label, k=7):
+    max_th = float(score.max())
+    max_th = np.percentile(score, 99.91)
+    print("max_th", max_th)
+    min_th = float(score.min())
+    grain = 2000
+    max_f1_1 = 0.0
+    max_f1_th_1 = 0.0
+    pre = 0.0
+    reca = 0.0
+    for i in range(0, grain + 3):
+        #print(i)
+        thres = (max_th - min_th) / grain * i + min_th
+        predict = score >= thres
+        predict = get_range_proba(predict, label, k)
+        f1, precision, recall, tp, tn, fp, fn = calc_p2p(predict, label)
+        if f1 > max_f1_1:
+            max_f1_1 = f1
+            max_f1_th_1 = thres
+            pre = precision
+            reca = recall
+        predict = get_range_proba(score >= max_f1_th_1, label, k)
+        #print(max_f1_th_1)
+    return max_f1_1, pre, reca, predict
+
+def point_adjust(score, label, thres):
+    predict = score >= thres
+    actual = label > 0.1
+    anomaly_state = False
+
+    for i in range(len(score)):
+        if actual[i] and predict[i] and not anomaly_state:
+            anomaly_state = True
+            for j in range(i, 0, -1):
+                if not actual[j]:
+                    break
+                else:
+                    predict[j] = True
+        elif not actual[i]:
+            anomaly_state = False
+        if anomaly_state:
+            predict[i] = True
+    return predict, actual
+
+
+def best_f1(score, label):
+    # max_th = float(score.max())
+    max_th = np.percentile(score, 99.91)
+    print("max_th", max_th)
+    min_th = float(score.min())
+    grain = 2000
+    max_f1_1 = 0.0
+    max_f1_th_1 = 0.0
+    pre = 0.0
+    rec = 0.0
+    for i in range(0, grain + 3):
+        thres = (max_th - min_th) / grain * i + min_th
+        predict, actual = point_adjust(score, label, thres=thres)
+        f1, precision, recall, tp, tn, fp, fn = calc_p2p(predict, actual)
+        if f1 > max_f1_1:
+            max_f1_1 = f1
+            max_f1_th_1 = thres
+            pre = precision
+            rec = recall
+    predict, actual = point_adjust(score, label, max_f1_th_1)
+    print('thres',max_f1_th_1)
+    return max_f1_1,pre,rec, predict
 
 class EarlyStopping:
     def __init__(self, patience=7, verbose=False, dataset_name='', delta=0):
@@ -171,7 +276,6 @@ class Solver(object):
                                                                                                        self.win_size)))))
                 series_loss = series_loss / len(prior)
                 prior_loss = prior_loss / len(prior)
-
                 rec_loss = self.criterion(output, input)
 
                 loss1_list.append((rec_loss - self.k * series_loss).item())
@@ -193,7 +297,7 @@ class Solver(object):
             print("Epoch: {} cost time: {}".format(epoch + 1, time.time() - epoch_time))
             train_loss = np.average(loss1_list)
 
-            vali_loss1, vali_loss2 = self.vali(self.test_loader)
+            vali_loss1, vali_loss2 = self.vali(self.vali_loader)
 
             print(
                 "Epoch: {0}, Steps: {1} | Train Loss: {2:.7f} Vali Loss: {3:.7f} ".format(
@@ -216,78 +320,79 @@ class Solver(object):
         criterion = nn.MSELoss(reduce=False)
 
         # (1) stastic on the train set
-        attens_energy = []
-        for i, (input_data, labels) in enumerate(self.train_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
-            loss = torch.mean(criterion(input, output), dim=-1)
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                if u == 0:
-                    series_loss = my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss = my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-                else:
-                    series_loss += my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss += my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
+        # attens_energy = []
+        # for i, (input_data, labels) in enumerate(self.train_loader):
+        #     input = input_data.float().to(self.device)
+        #     output, series, prior, _ = self.model(input)
+        #     loss = torch.mean(criterion(input, output), dim=-1)
+        #     series_loss = 0.0
+        #     prior_loss = 0.0
+        #     for u in range(len(prior)):
+        #         if u == 0:
+        #             series_loss = my_kl_loss(series[u], (
+        #                     prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                            self.win_size)).detach()) * temperature
+        #             prior_loss = my_kl_loss(
+        #                 (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                         self.win_size)),
+        #                 series[u].detach()) * temperature
+        #         else:
+        #             series_loss += my_kl_loss(series[u], (
+        #                     prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                            self.win_size)).detach()) * temperature
+        #             prior_loss += my_kl_loss(
+        #                 (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                         self.win_size)),
+        #                 series[u].detach()) * temperature
+        #     metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+        #     cri = metric * loss
+        #     cri = cri.detach().cpu().numpy()
+        #     attens_energy.append(cri)
 
-            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-            cri = metric * loss
-            cri = cri.detach().cpu().numpy()
-            attens_energy.append(cri)
+        # attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+        # train_energy = np.array(attens_energy)
 
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-        train_energy = np.array(attens_energy)
+        # # (2) find the threshold
+        # attens_energy = []
+        # for i, (input_data, labels) in enumerate(self.thre_loader):
+        #     input = input_data.float().to(self.device)
+        #     output, series, prior, _ = self.model(input)
 
-        # (2) find the threshold
-        attens_energy = []
-        for i, (input_data, labels) in enumerate(self.thre_loader):
-            input = input_data.float().to(self.device)
-            output, series, prior, _ = self.model(input)
+        #     loss = torch.mean(criterion(input, output), dim=-1)
 
-            loss = torch.mean(criterion(input, output), dim=-1)
+        #     series_loss = 0.0
+        #     prior_loss = 0.0
+        #     for u in range(len(prior)):
+        #         if u == 0:
+        #             series_loss = my_kl_loss(series[u], (
+        #                     prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                            self.win_size)).detach()) * temperature
+        #             prior_loss = my_kl_loss(
+        #                 (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                         self.win_size)),
+        #                 series[u].detach()) * temperature
+        #         else:
+        #             series_loss += my_kl_loss(series[u], (
+        #                     prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                            self.win_size)).detach()) * temperature
+        #             prior_loss += my_kl_loss(
+        #                 (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
+        #                                                                                         self.win_size)),
+        #                 series[u].detach()) * temperature
+        #     # Metric
+        #     metric = torch.softmax((-series_loss - prior_loss), dim=-1)
+        #     cri = metric * loss
+        #     cri = cri.detach().cpu().numpy()
+        #     attens_energy.append(cri)
 
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                if u == 0:
-                    series_loss = my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss = my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-                else:
-                    series_loss += my_kl_loss(series[u], (
-                            prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                   self.win_size)).detach()) * temperature
-                    prior_loss += my_kl_loss(
-                        (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1,
-                                                                                                self.win_size)),
-                        series[u].detach()) * temperature
-            # Metric
-            metric = torch.softmax((-series_loss - prior_loss), dim=-1)
-            cri = metric * loss
-            cri = cri.detach().cpu().numpy()
-            attens_energy.append(cri)
+        # attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
+        # test_energy = np.array(attens_energy)
+        # combined_energy = np.concatenate([train_energy, test_energy], axis=0)
+        # thresh = np.percentile(combined_energy, 100 - self.anormly_ratio)
+        # print("Threshold :", thresh)
 
-        attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
-        test_energy = np.array(attens_energy)
-        combined_energy = np.concatenate([train_energy, test_energy], axis=0)
-        thresh = np.percentile(combined_energy, 100 - self.anormly_ratio)
-        print("Threshold :", thresh)
 
+        time1 = time.time()
         # (3) evaluation on the test set
         test_labels = []
         attens_energy = []
@@ -322,54 +427,72 @@ class Solver(object):
             cri = cri.detach().cpu().numpy()
             attens_energy.append(cri)
             test_labels.append(labels)
+        time2 = time.time()
 
         attens_energy = np.concatenate(attens_energy, axis=0).reshape(-1)
         test_labels = np.concatenate(test_labels, axis=0).reshape(-1)
         test_energy = np.array(attens_energy)
         test_labels = np.array(test_labels)
 
-        pred = (test_energy > thresh).astype(int)
 
-        gt = test_labels.astype(int)
 
-        print("pred:   ", pred.shape)
-        print("gt:     ", gt.shape)
+        kk=7
+        if self.dataset=='Yahoo':
+            kk=3
+        
+        d_f1,d_pre,d_rec,predict = delay_f1(test_energy,test_labels,kk)
+        m_f1,m_pre,m_rec,m_predict = best_f1(test_energy,test_labels)
+
+        # pred = (test_energy > thresh).astype(int)
+
+        # gt = test_labels.astype(int)
+
+        # print("pred:   ", pred.shape)
+        # print("gt:     ", gt.shape)
 
         # detection adjustment
-        anomaly_state = False
-        for i in range(len(gt)):
-            if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
-                anomaly_state = True
-                for j in range(i, 0, -1):
-                    if gt[j] == 0:
-                        break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
-                for j in range(i, len(gt)):
-                    if gt[j] == 0:
-                        break
-                    else:
-                        if pred[j] == 0:
-                            pred[j] = 1
-            elif gt[i] == 0:
-                anomaly_state = False
-            if anomaly_state:
-                pred[i] = 1
+        # anomaly_state = False
+        # for i in range(len(gt)):
+        #     if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
+        #         anomaly_state = True
+        #         for j in range(i, 0, -1):
+        #             if gt[j] == 0:
+        #                 break
+        #             else:
+        #                 if pred[j] == 0:
+        #                     pred[j] = 1
+        #         for j in range(i, len(gt)):
+        #             if gt[j] == 0:
+        #                 break
+        #             else:
+        #                 if pred[j] == 0:
+        #                     pred[j] = 1
+        #     elif gt[i] == 0:
+        #         anomaly_state = False
+        #     if anomaly_state:
+        #         pred[i] = 1
 
-        pred = np.array(pred)
-        gt = np.array(gt)
-        print("pred: ", pred.shape)
-        print("gt:   ", gt.shape)
+        # kk=7
+        # if self.dataset=='Yahoo':
+        #     kk=3
+        # new_pred = get_range_proba(pred,gt,kk)
+        # pred = new_pred
 
-        from sklearn.metrics import precision_recall_fscore_support
-        from sklearn.metrics import accuracy_score
-        accuracy = accuracy_score(gt, pred)
-        precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
-                                                                              average='binary')
-        print(
-            "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
-                accuracy, precision,
-                recall, f_score))
+        # pred = np.array(pred)
+        # gt = np.array(gt)
+        # print("pred: ", pred.shape)
+        # print("gt:   ", gt.shape)
 
-        return accuracy, precision, recall, f_score
+        # from sklearn.metrics import precision_recall_fscore_support
+        # from sklearn.metrics import accuracy_score
+        # accuracy = accuracy_score(gt, pred)
+        # precision, recall, f_score, support = precision_recall_fscore_support(gt, pred,
+        #                                                                       average='binary')
+        # print(
+        #     "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
+        #         accuracy, precision,
+        #         recall, f_score))
+        with open('./all_result.txt','a') as f:
+            f.write('%f %f %f %f %f %f %f\n'%(time2-time1,d_f1,d_pre,d_rec,m_f1,m_pre,m_rec))
+        print(d_f1,d_pre,d_rec)
+        return 0, d_pre, d_rec, d_f1
